@@ -2,6 +2,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from app.db import connect
+from app.services.daykey import DayKeyError, validate_dock_day
 
 router = APIRouter(tags=["settings"])
 
@@ -22,15 +23,17 @@ def get_settings():
 
 @router.post("/settings/dock-day")
 def set_dock_day(body: DayIn):
-    if len(body.dock_day) != 10:
-        raise HTTPException(400, "dock_day 格式应为 YYYY-MM-DD")
+    try:
+        day = validate_dock_day(body.dock_day)
+    except DayKeyError as e:
+        raise HTTPException(400, str(e)) from e
     conn = connect()
     try:
         conn.execute(
             "INSERT INTO settings(key, value) VALUES ('dock_day', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (body.dock_day,),
+            (day,),
         )
         conn.commit()
-        return {"dock_day": body.dock_day}
+        return {"dock_day": day}
     finally:
         conn.close()

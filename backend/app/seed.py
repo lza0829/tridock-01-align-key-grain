@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS reconcile_batches (
   variance_count INTEGER NOT NULL,
   status TEXT NOT NULL,
   sealed_at TEXT,
-  note TEXT
+  note TEXT,
+  fold_rule TEXT NOT NULL DEFAULT 'declared_dock_day'
 );
 CREATE TABLE IF NOT EXISTS match_rows (
   id INTEGER PRIMARY KEY,
@@ -85,13 +86,65 @@ CREATE TABLE IF NOT EXISTS reopen_requests (
   dock_day TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'none'
 );
+CREATE TABLE IF NOT EXISTS ingest_events (
+  id INTEGER PRIMARY KEY,
+  leg TEXT NOT NULL,
+  line_no TEXT NOT NULL,
+  supplier_code TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  declared_dock_day TEXT NOT NULL,
+  closed_dock_day TEXT NOT NULL,
+  occurred_at TEXT,
+  qty REAL NOT NULL,
+  fold_rule TEXT NOT NULL,
+  folded_count INTEGER NOT NULL,
+  result TEXT NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ingest_closed_day ON ingest_events(closed_dock_day);
+CREATE INDEX IF NOT EXISTS idx_ingest_result ON ingest_events(result);
 '''
+
+# 已存在库的轻量迁移：补齐快照表（旧库无此表时 SCHEMA 的 IF NOT EXISTS 已覆盖，
+# 这里保留显式迁移点，后续口径升级只在此追加）。
+MIGRATIONS = [
+    '''CREATE TABLE IF NOT EXISTS ingest_events (
+  id INTEGER PRIMARY KEY,
+  leg TEXT NOT NULL,
+  line_no TEXT NOT NULL,
+  supplier_code TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  declared_dock_day TEXT NOT NULL,
+  closed_dock_day TEXT NOT NULL,
+  occurred_at TEXT,
+  qty REAL NOT NULL,
+  fold_rule TEXT NOT NULL,
+  folded_count INTEGER NOT NULL,
+  result TEXT NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL
+)''',
+    "CREATE INDEX IF NOT EXISTS idx_ingest_closed_day ON ingest_events(closed_dock_day)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_result ON ingest_events(result)",
+    # 旧库补批次口径列；全局架构 A，历史批次同口径
+    "ALTER TABLE reconcile_batches ADD COLUMN fold_rule TEXT NOT NULL DEFAULT 'declared_dock_day'",
+]
 
 
 def seed_if_empty() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        existing_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(reconcile_batches)").fetchall()
+        }
+        for stmt in MIGRATIONS:
+            if stmt.startswith("ALTER TABLE reconcile_batches ADD COLUMN fold_rule"):
+                if "fold_rule" in existing_cols:
+                    continue
+            conn.execute(stmt)
+        conn.commit()
         if conn.execute("SELECT COUNT(*) c FROM suppliers").fetchone()["c"]:
             return
         conn.execute("INSERT INTO settings(key, value) VALUES ('dock_day', ?)", ("2026-11-18",))
@@ -138,6 +191,30 @@ def seed_if_empty() -> None:
                 '''INSERT INTO confirm_lines(confirm_no, supplier_code, sku, dock_day, qty, note, created_at)
                    VALUES (?,?,?,?,?,?,?)''',
                 (*row, "2026-11-18T12:00:00Z"),
+            )
+        # 夹具数据同步补批次快照：正式行与快照同口径（fold_rule=declared_dock_day，零折日）
+        from app.services.daykey import DAY_KEY_RULE
+
+        for doc_no, sup, sku, day, qty, _note in expects:
+            conn.execute(
+                '''INSERT INTO ingest_events(leg, line_no, supplier_code, sku, declared_dock_day,
+                       closed_dock_day, occurred_at, qty, fold_rule, folded_count, result, reason, created_at)
+                   VALUES ('expect',?,?,?,?,?,NULL,?,? ,0,'accepted',NULL,?)''',
+                (doc_no, sup, sku, day, day, qty, DAY_KEY_RULE, "2026-11-18T08:00:00Z"),
+            )
+        for rc_no, sup, sku, day, qty, occurred, _note in receives:
+            conn.execute(
+                '''INSERT INTO ingest_events(leg, line_no, supplier_code, sku, declared_dock_day,
+                       closed_dock_day, occurred_at, qty, fold_rule, folded_count, result, reason, created_at)
+                   VALUES ('receive',?,?,?,?,?,?,?,? ,0,'accepted',NULL,?)''',
+                (rc_no, sup, sku, day, day, occurred, qty, DAY_KEY_RULE, occurred),
+            )
+        for cf_no, sup, sku, day, qty, _note in confirms:
+            conn.execute(
+                '''INSERT INTO ingest_events(leg, line_no, supplier_code, sku, declared_dock_day,
+                       closed_dock_day, occurred_at, qty, fold_rule, folded_count, result, reason, created_at)
+                   VALUES ('confirm',?,?,?,?,?,NULL,?,? ,0,'accepted',NULL,?)''',
+                (cf_no, sup, sku, day, day, qty, DAY_KEY_RULE, "2026-11-18T12:00:00Z"),
             )
         conn.commit()
     finally:
